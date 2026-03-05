@@ -136,17 +136,33 @@ celerybeat.pid
 
 # Environments
 .env
-.envrc
 .venv
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Project Specific
+data/*.db
+uploads/*
+!uploads/.gitkeep
+results/*
+!results/.gitkeep
+*.m4a
+*.mp3
+*.wav
+*.webm
+*.pdf
+*.txt
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
 
 # Rope project settings
 .ropeproject

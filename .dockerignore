@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.env
+data/
+uploads/
+results/
+/tmp/
+.git
+.gitignore
+*.m4a
+*.pdf
+test_stt.py
+result.txt
