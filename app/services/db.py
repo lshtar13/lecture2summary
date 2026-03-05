@@ -2,7 +2,7 @@ import os
 import datetime
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, String, Text, DateTime, select, delete
+from sqlalchemy import Column, String, Text, DateTime, select, delete, Integer
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,15 +32,30 @@ class Lecture(Base):
 class UsageLog(Base):
     __tablename__ = "usage_logs"
 
-    id = Column(DateTime, primary_key=True, default=datetime.datetime.utcnow)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     model_name = Column(String)
-    input_tokens = Column(Text)  # Store as string/int
+    input_tokens = Column(Text)
     output_tokens = Column(Text)
     request_count = Column(Text, default="1")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 async def init_db():
+    print("Initializing database...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        
+        # Manually add missing columns if table already existed (basic migration)
+        def add_columns_if_missing(sync_conn):
+            print("Checking/Updating schema columns...")
+            from sqlalchemy import text
+            # PostgreSQL supports ADD COLUMN IF NOT EXISTS since 9.6
+            sync_conn.execute(text("ALTER TABLE lectures ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0"))
+            sync_conn.execute(text("ALTER TABLE lectures ADD COLUMN IF NOT EXISTS current_step VARCHAR"))
+            sync_conn.execute(text("ALTER TABLE lectures ADD COLUMN IF NOT EXISTS active_model VARCHAR"))
+            print("Schema check complete.")
+            
+        await conn.run_sync(add_columns_if_missing)
+    print("Database initialized successfully.")
 
 async def log_usage(model_name: str, input_tokens: int, output_tokens: int):
     async with AsyncSessionLocal() as session:

@@ -1,6 +1,10 @@
 import os
 import time
 import mimetypes
+import asyncio
+import json
+import glob
+from pathlib import Path
 from google import genai
 
 # Ensure mimetypes for audio files are known to the system so Gemini SDK doesn't fail
@@ -54,19 +58,26 @@ class GeminiService:
         chunks = sorted(glob.glob(str(Path(audio_path).parent / f"chunk_*_{Path(audio_path).name}")))
         return chunks
 
-    def process_audio(self, audio_path: str, pdf_path: str | None = None, task_id: str | None = None) -> dict:
-        """Process audio file in chunks with multi-step correction and progress tracking."""
-        import asyncio
+    def process_audio(self, audio_path: str, pdf_path: str = None, task_id: str = None, loop=None):
+        """
+        Full orchestration of STT, Correction, and Summary.
+        Returns a dict with summary, transcript, and full_text.
+        """
         from app.services import db
 
-        async def update_progress(p: int, step: str, model: str = None):
-            if task_id:
+        def update_progress(p: int, step: str, model: str = None):
+            if task_id and loop:
                 try:
-                    # In sync method, use run_coroutine_threadsafe or create_task if loop exists
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(db.update_lecture_status(task_id, progress=p, current_step=step, active_model=model))
-                except: pass
+                    # In sync method, use run_coroutine_threadsafe to talk back to main loop
+                    asyncio.run_coroutine_threadsafe(
+                        db.update_lecture_status(task_id, progress=p, current_step=step, active_model=model),
+                        loop
+                    )
+                    # Also broadcast status via WebSocket if possible
+                    from app.services.websocket import broadcast_status
+                    asyncio.run_coroutine_threadsafe(broadcast_status(), loop)
+                except Exception as e:
+                    print(f"Error updating progress: {e}")
 
         # 1. Split Audio
         update_progress(5, "오디오 분할 중...")
@@ -78,13 +89,19 @@ class GeminiService:
         uploaded_files = []
         
         models_to_try = [
-            "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", 
-            "gemini-3-flash-preview", "gemini-2.5-flash-lite"
+            "models/gemini-2.5-flash-lite", "models/gemini-3.1-flash-lite-preview",
+            "models/gemini-2.5-flash", "models/gemini-2.0-flash", 
+            "models/gemini-flash-latest"
         ]
+        
+        active_model_name = models_to_try[0] # Default tracking
 
         for i, chunk in enumerate(chunks):
             step_msg = f"텍스트 변환 중 ({i+1}/{num_chunks})..."
             progress_val = 10 + int((i / num_chunks) * 60) # 10% to 70% range
+            
+            # Use current active model for display
+            update_progress(progress_val, step_msg, active_model_name)
             
             audio_mime = self._get_mime_type(chunk)
             audio_kwargs = {"file": chunk}
@@ -99,18 +116,35 @@ class GeminiService:
                 time.sleep(1)
                 curr = self.client.files.get(name=f.name)
             
-            stt_prompt = "이 오디오의 내용을 타임스탬프없이 있는 그대로 텍스트로 변환해주세요. 불필요한 추임새는 제거하고 문장 단위로 끊어주세요."
+            stt_prompt = """
+당신은 완벽한 오디오 전사(STT)를 수행하는 전문 속기사입니다.
+이 오디오 파일에서 들리는 **모든 음성과 단어를 단 하나의 수정이나 생략 없이 100% 있는 그대로(Verbatim) 텍스트로 똑같이 받아쓰기** 하세요.
+
+[절대 금지 사항 - 위반 시 실패]
+1. 화자가 반말, 사투리, 비속어, 은어, 문법에 맞지 않는 말을 하더라도 **절대 존댓말이나 올바른 문장으로 교정(윤문)하지 마세요**. 들리는 텍스트 표기 그대로 출력하세요.
+2. 화자가 말하지 않은 내용, 맥락 설명, 괄호 (예: (침묵), (기침), (JSON 내 텍스트 제공) 등), 메타 데이터, 요약을 **절대로 임의로 추가하지 마세요**.
+3. 본인의 생각이나 외부 지식을 텍스트에 섞지 마세요.
+4. 문단 단위의 타임스탬프를 마음대로 추가하지 마세요. 오직 끊이지 않는 텍스트로만 출력하세요.
+
+오직 오디오에서 화자가 발음한 "그 단어들 자체"만 출력하세요.
+"""
             
             chunk_text = ""
             for model_name in models_to_try:
                 try:
-                    update_progress(progress_val, step_msg, model_name)
+                    active_model_name = model_name # Update active model for display
+                    update_progress(progress_val, step_msg, active_model_name)
                     response = self.client.models.generate_content(model=model_name, contents=[f, stt_prompt])
                     chunk_text = response.text
                     # Log usage
-                    if task_id: 
-                        loop = asyncio.get_event_loop()
-                        loop.create_task(db.log_usage(model_name, response.usage_metadata.prompt_token_count, response.usage_metadata.candidates_token_count))
+                    if task_id and loop: 
+                        asyncio.run_coroutine_threadsafe(
+                            db.log_usage(model_name, response.usage_metadata.prompt_token_count, response.usage_metadata.candidates_token_count),
+                            loop
+                        )
+                        # Broadcast usage update
+                        from app.services.websocket import broadcast_usage
+                        asyncio.run_coroutine_threadsafe(broadcast_usage(), loop)
                     break
                 except Exception as e:
                     if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e): continue
@@ -141,33 +175,53 @@ class GeminiService:
                 curr = self.client.files.get(name=pdf_f.name)
             
             final_prompt = (
-                f"다음은 강의의 전체 STT 결과와 교안 PDF입니다. 교안의 전문 용어와 맥락을 참고하여 "
-                f"STT 결과를 깔끔한 문장으로 교정하고 핵심 내용을 요약해주세요.\n\n"
-                f"**지침**:\n"
-                f"- '음', '어', '이거 이거' 등 반복어와 추임새 완벽 제거.\n"
-                f"- 메타 데이터나 인사말 없이 본문만 출력.\n"
-                f"- 5분 단위로 타임스탬프(MM:SS)를 삽입하며 구조화하세요.\n\n"
-                f"## 핵심 요약\n\n## 전체 텍스트\n\n--- STT 데이터 ---\n{full_raw_text}"
+                f"당신은 음성 인식(STT) 결과를 교정하고 핵심을 요약하는 전문가입니다.\n"
+                f"다음은 오디오를 그대로 받아 적은 STT 원문과 참고용 교안 PDF입니다.\n\n"
+                f"[요구사항 1: 전체 텍스트 출력 - 절대 축약 금지!]\n"
+                f"- 제공된 'STT 데이터'의 내용을 단 한 줄도 버리지 말고 **처음부터 끝까지 100% 모두 복구하여 출력**하세요.\n"
+                f"- STT 데이터가 반말, 비문, 사투리라도 **절대로 존댓말로 바꾸거나 문장을 예쁘게 윤문(수정)하지 마세요**. 원본의 어투와 화법을 완벽히 보존하세요.\n"
+                f"- 가짜 '00:00:00' 타임스탬프나 '(중략)' 같은 메타 텍스트를 절대로 생성하지 마세요.\n"
+                f"- 오직 '전문 용어의 오탈자'(예: RPC를 RPCs로 쓴 것 등)만 교안을 참고하여 살짝 수정할 수 있습니다.\n\n"
+                f"[요구사항 2: 핵심 요약]\n"
+                f"- STT의 전체 맥락을 바탕으로 강의의 핵심 내용을 상단에 5~10줄 내외로 요약하세요.\n\n"
+                f"**출력 형식은 반드시 아래와 같이 작성해야 합니다:**\n"
+                f"## 핵심 요약\n(이곳에 요약 작성)\n\n## 전체 텍스트\n(이곳에 단 한 글자도 누락 없는 100% STT 원문 작성)\n\n"
+                f"--- STT 데이터 ---\n{full_raw_text}"
             )
         else:
             final_prompt = (
-                f"다음은 강의의 전체 STT 결과입니다. 내용을 깔끔한 문장으로 교정하고 핵심 내용을 요약해주세요.\n\n"
-                f"**지침**:\n"
-                f"- '음', '어', '이거 이거' 등 반복어와 추임새 완벽 제거.\n"
-                f"- 메타 데이터나 인사말 없이 본문만 출력.\n"
-                f"- 5분 단위로 타임스탬프(MM:SS)를 삽입하며 구조화하세요.\n\n"
-                f"## 핵심 요약\n\n## 전체 텍스트\n\n--- STT 데이터 ---\n{full_raw_text}"
+                f"당신은 음성 인식(STT) 결과를 교정하고 핵심을 요약하는 전문가입니다.\n"
+                f"다음은 오디오를 그대로 받아 적은 STT 원문입니다.\n\n"
+                f"[요구사항 1: 전체 텍스트 출력 - 절대 축약 금지!]\n"
+                f"- 제공된 'STT 데이터'의 내용을 단 한 줄도 버리지 말고 **처음부터 끝까지 100% 모두 복구하여 출력**하세요.\n"
+                f"- STT 데이터가 반말, 비문, 사투리라도 **절대로 존댓말로 바꾸거나 문장을 예쁘게 윤문(수정)하지 마세요**. 원본의 어투와 화법을 완벽히 보존하세요.\n"
+                f"- 가짜 '00:00:00' 타임스탬프나 '(중략)' 같은 메타 텍스트를 절대로 생성하지 마세요.\n"
+                f"- 명백한 오탈자만 살짝 수정하고 원래 화자의 말은 그대로 둡니다.\n\n"
+                f"[요구사항 2: 핵심 요약]\n"
+                f"- STT의 전체 맥락을 바탕으로 강의의 핵심 내용을 상단에 5~10줄 내외로 요약하세요.\n\n"
+                f"**출력 형식은 반드시 아래와 같이 작성해야 합니다:**\n"
+                f"## 핵심 요약\n(이곳에 요약 작성)\n\n## 전체 텍스트\n(이곳에 단 한 글자도 누락 없는 100% STT 원문 작성)\n\n"
+                f"--- STT 데이터 ---\n{full_raw_text}"
             )
 
         final_result_text = ""
-        for model_name in models_to_try:
+        for model_name in [
+            "models/gemini-2.5-flash-lite", "models/gemini-3.1-flash-lite-preview",
+            "models/gemini-2.5-flash", "models/gemini-2.0-flash", 
+            "models/gemini-flash-latest"
+        ]:
             try:
                 update_progress(90, "최종 교정 및 요약 중...", model_name)
                 response = self.client.models.generate_content(model=model_name, contents=final_files + [final_prompt])
                 final_result_text = response.text
-                if task_id:
-                    loop = asyncio.get_event_loop()
-                    loop.create_task(db.log_usage(model_name, response.usage_metadata.prompt_token_count, response.usage_metadata.candidates_token_count))
+                if task_id and loop:
+                    asyncio.run_coroutine_threadsafe(
+                        db.log_usage(model_name, response.usage_metadata.prompt_token_count, response.usage_metadata.candidates_token_count),
+                        loop
+                    )
+                    # Broadcast usage update
+                    from app.services.websocket import broadcast_usage
+                    asyncio.run_coroutine_threadsafe(broadcast_usage(), loop)
                 break
             except Exception as e:
                 if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e): continue

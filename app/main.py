@@ -17,33 +17,7 @@ from app.services import db
 from app.services.gemini import GeminiService
 from app.services.storage import StorageService
 
-# WebSocket Connection Manager
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            try:
-                await connection.send_text(message)
-            except:
-                pass
-
-manager = ConnectionManager()
-
-async def broadcast_usage():
-    stats = await db.get_total_usage()
-    await manager.broadcast(json.dumps({
-        "type": "usage_update",
-        "stats": stats
-    }))
+from app.services.websocket import manager, broadcast_usage, broadcast_status
 
 # Load .env
 load_dotenv()
@@ -67,6 +41,45 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Lecture2Summary", lifespan=lifespan)
 storage = StorageService()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.websocket("/ws/usage")
+async def websocket_usage(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        # Send initial stats
+        stats = await db.get_total_usage()
+        await websocket.send_text(json.dumps({
+            "type": "usage_update",
+            "stats": stats
+        }))
+        
+        # Send initial history
+        async with db.AsyncSessionLocal() as session:
+            result = await session.execute(db.select(db.Lecture).order_by(db.Lecture.created_at.desc()))
+            lectures = result.scalars().all()
+            lecture_list = []
+            for l in lectures:
+                lecture_list.append({
+                    "id": l.id, "title": l.title, "status": l.status,
+                    "progress": l.progress, "current_step": l.current_step,
+                    "active_model": l.active_model, "created_at": str(l.created_at)
+                })
+            await websocket.send_text(json.dumps({
+                "type": "status_update",
+                "lectures": lecture_list
+            }))
+        while True:
+            await websocket.receive_text() # Keep alive
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 # ── API Routes ──────────────────────────────────────────
 
@@ -109,22 +122,23 @@ async def upload_and_process(
     await db.create_lecture(task_id, title, audio_filename, pdf_filename)
 
     # Start background processing
-    asyncio.create_task(_process_task(task_id, audio_filename, pdf_filename))
+    asyncio.create_task(background_task_orchestrator(task_id, audio_filename, pdf_filename))
 
     return {"task_id": task_id, "status": "processing"}
 
 
-async def _process_task(task_id: str, audio_filename: str, pdf_filename: str | None):
+async def background_task_orchestrator(task_id: str, audio_filename: str, pdf_filename: str | None):
     try:
         # Download files from MinIO to local temp for Gemini
         audio_local = f"/tmp/{audio_filename}"
         storage.download_file(audio_filename, audio_local)
         
+        pdf_local = None
         if pdf_filename:
             pdf_local = f"/tmp/{pdf_filename}"
             storage.download_file(pdf_filename, pdf_local)
 
-        await _process_task(task_id, audio_local, pdf_local)
+        await _perform_stt_task(task_id, audio_local, pdf_local)
 
     except Exception as e:
         print(f"Task {task_id} failed during download or initial setup: {e}")
@@ -135,29 +149,15 @@ async def _process_task(task_id: str, audio_filename: str, pdf_filename: str | N
         if pdf_local and os.path.exists(pdf_local): os.remove(pdf_local)
 
 
-async def broadcast_status():
-    async with db.AsyncSessionLocal() as session:
-        result = await session.execute(db.select(db.Lecture).order_by(db.Lecture.created_at.desc()))
-        lectures = result.scalars().all()
-        # Convert to dict for JSON
-        lecture_list = []
-        for l in lectures:
-            lecture_list.append({
-                "id": l.id, "title": l.title, "status": l.status,
-                "progress": l.progress, "current_step": l.current_step,
-                "active_model": l.active_model, "created_at": str(l.created_at)
-            })
-        await manager.broadcast(json.dumps({
-            "type": "status_update",
-            "lectures": lecture_list
-        }))
+# Helper functions moved to services/websocket.py
 
-async def _process_task(task_id: str, local_audio_path: str, local_pdf_path: str | None):
+async def _perform_stt_task(task_id: str, local_audio_path: str, local_pdf_path: str | None):
     try:
         gemini_service = GeminiService()
-        # Pass task_id for progress updates
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, gemini_service.process_audio, local_audio_path, local_pdf_path, task_id
+        # Pass task_id for progress updates and the event loop for thread-safe updates
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, gemini_service.process_audio, local_audio_path, local_pdf_path, task_id, loop
         )
         
         async with db.AsyncSessionLocal() as session:
@@ -209,7 +209,7 @@ async def retry_task(task_id: str):
             await session.commit()
 
     # Restart background task
-    asyncio.create_task(_process_task(task_id, lecture["audio_filename"], lecture["pdf_filename"]))
+    asyncio.create_task(background_task_orchestrator(task_id, lecture["audio_filename"], lecture["pdf_filename"]))
     
     return {"status": "retrying", "task_id": task_id}
 

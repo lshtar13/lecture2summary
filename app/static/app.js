@@ -381,6 +381,15 @@ function startPolling(taskId) {
                 clearInterval(pollInterval);
                 alert('처리 중 오류가 발생했습니다.');
                 showView('upload');
+            } else if (data.status === 'processing') {
+                const percent = data.progress || 0;
+                const bar = document.getElementById('progress-bar');
+                if (bar) bar.style.width = percent + '%';
+
+                const subtitle = document.getElementById('processing-subtitle');
+                if (subtitle && data.current_step) {
+                    subtitle.textContent = `${data.current_step} (${percent}%)`;
+                }
             }
         } catch (err) {
             console.error('Polling error:', err);
