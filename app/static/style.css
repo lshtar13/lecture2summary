@@ -905,3 +905,161 @@ body::before {
 ::-webkit-scrollbar-thumb:hover {
     background: rgba(255, 255, 255, 0.14);
 }
+
+/* ── Usage Dashboard ────────────────────────── */
+.usage-dashboard {
+    margin-top: 60px;
+    padding-top: 40px;
+    border-top: 1px dashed var(--border);
+}
+
+.usage-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.usage-header h2 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.live-indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--success);
+    background: rgba(0, 206, 201, 0.1);
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+.pulse {
+    width: 6px;
+    height: 6px;
+    background: var(--success);
+    border-radius: 50%;
+    animation: pulse-simple 1.5s infinite;
+}
+
+@keyframes pulse-simple {
+    0% {
+        transform: scale(1);
+        opacity: 1;
+    }
+
+    50% {
+        transform: scale(1.5);
+        opacity: 0.5;
+    }
+
+    100% {
+        transform: scale(1);
+        opacity: 1;
+    }
+}
+
+.usage-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+}
+
+.usage-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 18px;
+    transition: all var(--transition);
+}
+
+.usage-card:hover {
+    border-color: var(--accent);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow);
+}
+
+.usage-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 16px;
+}
+
+.model-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--accent-light);
+}
+
+.request-count {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: var(--bg-input);
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+.usage-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.stat-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.stat-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.stat-value {
+    font-weight: 600;
+    color: var(--text);
+}
+
+.usage-bar-bg {
+    height: 6px;
+    background: var(--bg-input);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.usage-bar-fill {
+    height: 100%;
+    background: var(--gradient-accent);
+    border-radius: 3px;
+    transition: width 0.5s ease-out;
+}
+
+.usage-loading {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 40px;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+/* ── Scrollbar & Animations ─────────────────── */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}

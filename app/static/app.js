@@ -440,22 +440,43 @@ async function loadHistory() {
             return;
         }
 
-        list.innerHTML = data.lectures.map(l => `
-            <div class="history-item" onclick="handleHistoryClick('${l.id}', '${l.status}')">
-                <div class="history-item-info">
-                    <h3>${escapeHtml(l.title)}</h3>
-                    <div class="history-item-meta">
-                        <span>${new Date(l.created_at).toLocaleString('ko-KR')}</span>
-                        ${l.pdf_filename ? '<span>📄 교안 포함</span>' : ''}
+        list.innerHTML = data.lectures.map(l => {
+            let statusBadge = '';
+            if (l.status === 'processing') {
+                const progress = l.progress || 0;
+                const step = l.current_step || '처리 중...';
+                const model = l.active_model ? `<span class="active-model-tag">${l.active_model}</span>` : '';
+                statusBadge = `
+                    <div class="processing-status-info">
+                        <div class="progress-bar-container">
+                            <div class="progress-bar-fill" style="width: ${progress}%"></div>
+                        </div>
+                        <div class="status-meta">
+                            <span class="step-label">${step} (${progress}%)</span>
+                            ${model}
+                        </div>
+                    </div>`;
+            } else {
+                statusBadge = `<span class="status-badge status-${l.status}">${statusText(l.status)}</span>`;
+            }
+
+            return `
+                <div class="history-item" onclick="handleHistoryClick('${l.id}', '${l.status}')">
+                    <div class="history-item-info">
+                        <h3>${escapeHtml(l.title)}</h3>
+                        <div class="history-item-meta">
+                            <span>${new Date(l.created_at).toLocaleString('ko-KR')}</span>
+                            ${l.pdf_filename ? '<span>📄 교안 포함</span>' : ''}
+                        </div>
+                    </div>
+                    <div class="history-item-actions">
+                        ${statusBadge}
+                        ${l.status === 'error' ? `<button class="retry-btn" onclick="event.stopPropagation(); retryTask('${l.id}')">재시도</button>` : ''}
+                        <button class="delete-btn" onclick="event.stopPropagation(); deleteHistory('${l.id}')">삭제</button>
                     </div>
                 </div>
-                <div class="history-item-actions">
-                    <span class="status-badge status-${l.status}">${statusText(l.status)}</span>
-                    ${l.status === 'error' ? `<button class="retry-btn" onclick="event.stopPropagation(); retryTask('${l.id}')">재시도</button>` : ''}
-                    <button class="delete-btn" onclick="event.stopPropagation(); deleteHistory('${l.id}')">삭제</button>
-                </div>
-            </div>
-        `).join('');
+            `;
+        }).join('');
     } catch (err) {
         console.error('History load error:', err);
     }
@@ -529,4 +550,77 @@ document.addEventListener('DOMContentLoaded', () => {
     setupDropZone('audio-drop-zone', 'audio-input', handleAudioFile);
     setupDropZone('pdf-drop-zone', 'pdf-input', handlePdfFile);
     drawIdleVisualizer();
+    initUsageDashboard();
 });
+
+// ── Usage Dashboard (WebSocket) ─────────────────────
+let usageSocket = null;
+
+function initUsageDashboard() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws/usage`;
+
+    usageSocket = new WebSocket(wsUrl);
+
+    usageSocket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'usage_update') {
+            updateUsageDashboard(data.stats);
+        } else if (data.type === 'status_update') {
+            renderHistory(data.lectures);
+        }
+    };
+
+    usageSocket.onclose = () => {
+        console.log('Usage WebSocket closed. Retrying in 5s...');
+        setTimeout(initUsageDashboard, 5000);
+    };
+}
+
+function updateUsageDashboard(stats) {
+    const container = document.getElementById('usage-cards');
+    if (!stats || Object.keys(stats).length === 0) {
+        container.innerHTML = '<div class="usage-loading">아직 사용 기록이 없습니다. 분석을 시작해 보세요!</div>';
+        return;
+    }
+
+    // Sort models by usage (most active first)
+    const sortedModels = Object.keys(stats).sort((a, b) => stats[b].requests - stats[a].requests);
+
+    container.innerHTML = sortedModels.map(model => {
+        const s = stats[model];
+        // Dynamic limits for visualization (adjust based on user tier usually)
+        const tokenLimit = 1000000; // 1M tokens as a reference 100%
+        const inputPercent = Math.min((s.input / tokenLimit) * 100, 100);
+        const outputPercent = Math.min((s.output / tokenLimit) * 100, 100);
+
+        return `
+            <div class="usage-card">
+                <div class="usage-card-header">
+                    <span class="model-name">${model}</span>
+                    <span class="request-count">${s.requests} Requests</span>
+                </div>
+                <div class="usage-stats">
+                    <div class="stat-row">
+                        <div class="stat-label">
+                            <span>Input Tokens</span>
+                            <span class="stat-value">${s.input.toLocaleString()}</span>
+                        </div>
+                        <div class="usage-bar-bg">
+                            <div class="usage-bar-fill" style="width: ${inputPercent}%"></div>
+                        </div>
+                    </div>
+                    <div class="stat-row">
+                        <div class="stat-label">
+                            <span>Output Tokens</span>
+                            <span class="stat-value">${s.output.toLocaleString()}</span>
+                        </div>
+                        <div class="usage-bar-bg">
+                            <div class="usage-bar-fill" style="width: ${outputPercent}%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+}

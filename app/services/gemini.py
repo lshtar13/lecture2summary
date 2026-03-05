@@ -31,112 +31,165 @@ class GeminiService:
             return "application/pdf"
         return None
 
-    def process_audio(self, audio_path: str, pdf_path: str | None = None) -> dict:
-        """Process audio file with optional PDF for correction."""
-        # Determine audio mime type config if possible
-        audio_mime = self._get_mime_type(audio_path)
-        audio_kwargs = {"file": audio_path}
-        if audio_mime:
-            audio_kwargs["config"] = {"mime_type": audio_mime}
+    def _split_audio(self, audio_path: str, chunk_length_sec: int = 600) -> list[str]:
+        """Split audio into chunks of specified length using ffmpeg."""
+        import subprocess
+        from pathlib import Path
+        
+        output_pattern = str(Path(audio_path).parent / f"chunk_%03d_{Path(audio_path).name}")
+        # Command: ffmpeg -i input -f segment -segment_time 600 -c copy output%03d.mp4
+        # Note: -c copy is fast but segmenting might not be precise on some codecs. 
+        # For precision we could re-encode, but let's try copy first for speed.
+        cmd = [
+            "ffmpeg", "-i", audio_path, 
+            "-f", "segment", 
+            "-segment_time", str(chunk_length_sec), 
+            "-c", "copy", 
+            output_pattern
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        # Get list of generated files
+        import glob
+        chunks = sorted(glob.glob(str(Path(audio_path).parent / f"chunk_*_{Path(audio_path).name}")))
+        return chunks
 
-        # Upload audio
-        audio_file = self.client.files.upload(**audio_kwargs)
-        uploaded_files = [audio_file]
+    def process_audio(self, audio_path: str, pdf_path: str | None = None, task_id: str | None = None) -> dict:
+        """Process audio file in chunks with multi-step correction and progress tracking."""
+        import asyncio
+        from app.services import db
 
-        if pdf_path:
-            pdf_mime = self._get_mime_type(pdf_path)
-            pdf_kwargs = {"file": pdf_path}
-            if pdf_mime:
-                pdf_kwargs["config"] = {"mime_type": pdf_mime}
-            pdf_file = self.client.files.upload(**pdf_kwargs)
-            uploaded_files.append(pdf_file)
-            prompt = (
-                "다음 오디오는 강의 녹음 파일이고, PDF는 해당 강의의 교안입니다.\n\n"
-                "아래 두 가지를 수행해 주세요:\n\n"
-                "1. **핵심 요약**: 강의 전체 내용을 파악하기 쉽게 핵심 요약을 제공해 주세요.\n"
-                "2. **전체 텍스트 변환**: 교안의 고유 명사, 전문 용어, 내용을 깊이 참고하여 "
-                "오디오를 텍스트로 완벽하게 변환해 주세요. **'어...', '음...', '그...'와 같은 불필요한 추임새나 중복되는 말들은 생략하고** "
-                "강의 문맥에 맞게 깔끔하게 교정된 텍스트를 제공해 주세요. "
-                "타임스탬프(MM:SS 형식)도 포함해 주세요.\n\n"
-                "출력 형식:\n"
-                "## 핵심 요약\n(요약 내용)\n\n"
-                "## 전체 텍스트\n(타임스탬프 포함 텍스트)"
-            )
-        else:
-            prompt = (
-                "다음 오디오는 강의 녹음 파일입니다.\n\n"
-                "아래 두 가지를 수행해 주세요:\n\n"
-                "1. **핵심 요약**: 강의 전체 내용을 파악하기 쉽게 핵심 요약을 제공해 주세요.\n"
-                "2. **전체 텍스트 변환**: 오디오를 정확히 텍스트로 변환해 주세요. "
-                "**'어...', '음...', '그...'와 같은 불필요한 추임새나 반복되는 말들은 모두 제거하고** "
-                "문장이 매끄럽게 이어지도록 교정해 주세요. "
-                "타임스탬프(MM:SS 형식)도 포함해 주세요.\n\n"
-                "출력 형식:\n"
-                "## 핵심 요약\n(요약 내용)\n\n"
-                "## 전체 텍스트\n(타임스탬프 포함 텍스트)"
-            )
+        async def update_progress(p: int, step: str, model: str = None):
+            if task_id:
+                try:
+                    # In sync method, use run_coroutine_threadsafe or create_task if loop exists
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(db.update_lecture_status(task_id, progress=p, current_step=step, active_model=model))
+                except: pass
 
-        # Wait for files to be processed
-        for f in uploaded_files:
+        # 1. Split Audio
+        update_progress(5, "오디오 분할 중...")
+        chunks = self._split_audio(audio_path)
+        num_chunks = len(chunks)
+        
+        # 2. Process each chunk for STT
+        all_transcripts = []
+        uploaded_files = []
+        
+        models_to_try = [
+            "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", 
+            "gemini-3-flash-preview", "gemini-2.5-flash-lite"
+        ]
+
+        for i, chunk in enumerate(chunks):
+            step_msg = f"텍스트 변환 중 ({i+1}/{num_chunks})..."
+            progress_val = 10 + int((i / num_chunks) * 60) # 10% to 70% range
+            
+            audio_mime = self._get_mime_type(chunk)
+            audio_kwargs = {"file": chunk}
+            if audio_mime: audio_kwargs["config"] = {"mime_type": audio_mime}
+            
+            f = self.client.files.upload(**audio_kwargs)
+            uploaded_files.append(f)
+            
+            # Wait for file
             curr = self.client.files.get(name=f.name)
             while curr.state.name == "PROCESSING":
-                time.sleep(2)
+                time.sleep(1)
                 curr = self.client.files.get(name=f.name)
-            if curr.state.name != "ACTIVE":
-                raise Exception(f"File {f.name} failed to process (state: {curr.state.name})")
+            
+            stt_prompt = "이 오디오의 내용을 타임스탬프없이 있는 그대로 텍스트로 변환해주세요. 불필요한 추임새는 제거하고 문장 단위로 끊어주세요."
+            
+            chunk_text = ""
+            for model_name in models_to_try:
+                try:
+                    update_progress(progress_val, step_msg, model_name)
+                    response = self.client.models.generate_content(model=model_name, contents=[f, stt_prompt])
+                    chunk_text = response.text
+                    # Log usage
+                    if task_id: 
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(db.log_usage(model_name, response.usage_metadata.prompt_token_count, response.usage_metadata.candidates_token_count))
+                    break
+                except Exception as e:
+                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e): continue
+                    raise e
+            
+            all_transcripts.append(chunk_text)
+            # Cleanup chunk file object immediately to free space/quota
+            try: self.client.files.delete(name=f.name)
+            except: pass
+            if os.path.exists(chunk): os.remove(chunk)
 
-        # Generate content with fallback logic
-        # Using exact model IDs verified from the environment
-        models_to_try = [
-            "gemini-2.5-flash",
-            "gemini-2.0-flash", 
-            "gemini-2.0-flash-lite", 
-            "gemini-3-flash-preview", 
-            "gemini-2.5-flash-lite"
-        ]
-        last_exception = None
-        result_text = None
+        full_raw_text = "\n".join(all_transcripts)
 
+        # 3. Final Correction & Summary
+        update_progress(80, "최종 교정 및 요약 중...")
+        
+        final_files = []
+        final_prompt = ""
+        
+        if pdf_path:
+            pdf_mime = self._get_mime_type(pdf_path)
+            pdf_f = self.client.files.upload(file=pdf_path, config={"mime_type": pdf_mime} if pdf_mime else None)
+            final_files.append(pdf_f)
+            # Wait for PDF
+            curr = self.client.files.get(name=pdf_f.name)
+            while curr.state.name == "PROCESSING":
+                time.sleep(1)
+                curr = self.client.files.get(name=pdf_f.name)
+            
+            final_prompt = (
+                f"다음은 강의의 전체 STT 결과와 교안 PDF입니다. 교안의 전문 용어와 맥락을 참고하여 "
+                f"STT 결과를 깔끔한 문장으로 교정하고 핵심 내용을 요약해주세요.\n\n"
+                f"**지침**:\n"
+                f"- '음', '어', '이거 이거' 등 반복어와 추임새 완벽 제거.\n"
+                f"- 메타 데이터나 인사말 없이 본문만 출력.\n"
+                f"- 5분 단위로 타임스탬프(MM:SS)를 삽입하며 구조화하세요.\n\n"
+                f"## 핵심 요약\n\n## 전체 텍스트\n\n--- STT 데이터 ---\n{full_raw_text}"
+            )
+        else:
+            final_prompt = (
+                f"다음은 강의의 전체 STT 결과입니다. 내용을 깔끔한 문장으로 교정하고 핵심 내용을 요약해주세요.\n\n"
+                f"**지침**:\n"
+                f"- '음', '어', '이거 이거' 등 반복어와 추임새 완벽 제거.\n"
+                f"- 메타 데이터나 인사말 없이 본문만 출력.\n"
+                f"- 5분 단위로 타임스탬프(MM:SS)를 삽입하며 구조화하세요.\n\n"
+                f"## 핵심 요약\n\n## 전체 텍스트\n\n--- STT 데이터 ---\n{full_raw_text}"
+            )
+
+        final_result_text = ""
         for model_name in models_to_try:
             try:
-                print(f"Attempting generation with {model_name}...")
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=uploaded_files + [prompt],
-                )
-                result_text = response.text
-                break # Success!
+                update_progress(90, "최종 교정 및 요약 중...", model_name)
+                response = self.client.models.generate_content(model=model_name, contents=final_files + [final_prompt])
+                final_result_text = response.text
+                if task_id:
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(db.log_usage(model_name, response.usage_metadata.prompt_token_count, response.usage_metadata.candidates_token_count))
+                break
             except Exception as e:
-                last_exception = e
-                # If it's a quota error, try the next model
-                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                    print(f"Quota exceeded for {model_name}. Trying fallback...")
-                    continue
-                else:
-                    # For other errors, raise immediately
-                    raise e
-        
-        if result_text is None:
-            raise last_exception
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e): continue
+                raise e
 
-        # Try to split summary and transcript
+        # Cleanup PDF file object
+        for f in final_files:
+            try: self.client.files.delete(name=f.name)
+            except: pass
+
+        # Split final output
         summary = ""
-        transcript = result_text
-        if "## 핵심 요약" in result_text and "## 전체 텍스트" in result_text:
-            parts = result_text.split("## 전체 텍스트")
-            summary_part = parts[0]
-            summary = summary_part.replace("## 핵심 요약", "").strip()
-            transcript = parts[1].strip() if len(parts) > 1 else ""
+        transcript = final_result_text
+        if "## 핵심 요약" in final_result_text and "## 전체 텍스트" in final_result_text:
+            parts = final_result_text.split("## 전체 텍스트")
+            summary = parts[0].replace("## 핵심 요약", "").strip()
+            transcript = parts[1].strip()
 
-        # Cleanup uploaded files
-        for f in uploaded_files:
-            try:
-                self.client.files.delete(name=f.name)
-            except Exception:
-                pass
-
+        update_progress(100, "분석 완료")
+        
         return {
-            "full_text": result_text,
+            "full_text": final_result_text,
             "summary": summary,
             "transcript": transcript,
         }

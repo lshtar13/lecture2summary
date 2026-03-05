@@ -1,10 +1,14 @@
 import os
 import uuid
 import asyncio
+import json
+import datetime
 from pathlib import Path
+from typing import List, Dict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from dotenv import load_dotenv
@@ -12,6 +16,34 @@ from dotenv import load_dotenv
 from app.services import db
 from app.services.gemini import GeminiService
 from app.services.storage import StorageService
+
+# WebSocket Connection Manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except:
+                pass
+
+manager = ConnectionManager()
+
+async def broadcast_usage():
+    stats = await db.get_total_usage()
+    await manager.broadcast(json.dumps({
+        "type": "usage_update",
+        "stats": stats
+    }))
 
 # Load .env
 load_dotenv()
@@ -88,26 +120,59 @@ async def _process_task(task_id: str, audio_filename: str, pdf_filename: str | N
         audio_local = f"/tmp/{audio_filename}"
         storage.download_file(audio_filename, audio_local)
         
-        pdf_local = None
         if pdf_filename:
             pdf_local = f"/tmp/{pdf_filename}"
             storage.download_file(pdf_filename, pdf_local)
 
-        gemini = GeminiService()
-        # Run in executor to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, gemini.process_audio, audio_local, pdf_local)
+        await _process_task(task_id, audio_local, pdf_local)
 
+    except Exception as e:
+        print(f"Task {task_id} failed during download or initial setup: {e}")
+        await db.update_lecture_error(task_id, str(e))
+    finally:
         # Cleanup local temp files
-        if os.path.exists(audio_local): os.remove(audio_local)
+        if audio_local and os.path.exists(audio_local): os.remove(audio_local)
         if pdf_local and os.path.exists(pdf_local): os.remove(pdf_local)
 
-        await db.update_lecture_result(
-            task_id,
-            summary=result["summary"],
-            transcript=result["transcript"],
-            full_text=result["full_text"],
+
+async def broadcast_status():
+    async with db.AsyncSessionLocal() as session:
+        result = await session.execute(db.select(db.Lecture).order_by(db.Lecture.created_at.desc()))
+        lectures = result.scalars().all()
+        # Convert to dict for JSON
+        lecture_list = []
+        for l in lectures:
+            lecture_list.append({
+                "id": l.id, "title": l.title, "status": l.status,
+                "progress": l.progress, "current_step": l.current_step,
+                "active_model": l.active_model, "created_at": str(l.created_at)
+            })
+        await manager.broadcast(json.dumps({
+            "type": "status_update",
+            "lectures": lecture_list
+        }))
+
+async def _process_task(task_id: str, local_audio_path: str, local_pdf_path: str | None):
+    try:
+        gemini_service = GeminiService()
+        # Pass task_id for progress updates
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, gemini_service.process_audio, local_audio_path, local_pdf_path, task_id
         )
+        
+        async with db.AsyncSessionLocal() as session:
+            db_lecture = await session.get(db.Lecture, task_id)
+            if db_lecture:
+                db_lecture.status = "completed" # Changed from "done" to "completed" to match existing schema
+                db_lecture.progress = 100
+                db_lecture.current_step = "완료"
+                db_lecture.active_model = None
+                db_lecture.summary = result["summary"]
+                db_lecture.transcript = result["transcript"]
+                db_lecture.full_text = result["full_text"]
+                await session.commit()
+        
+        await broadcast_status()
     except Exception as e:
         print(f"Task {task_id} failed: {e}")
         await db.update_lecture_error(task_id, str(e))

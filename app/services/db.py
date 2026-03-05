@@ -21,16 +21,54 @@ class Lecture(Base):
     audio_filename = Column(String)
     pdf_filename = Column(String)
     status = Column(String, default="processing")
+    progress = Column(Integer, default=0)
+    current_step = Column(String, nullable=True)
+    active_model = Column(String, nullable=True)
     summary = Column(Text, nullable=True)
     transcript = Column(Text, nullable=True)
     full_text = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+class UsageLog(Base):
+    __tablename__ = "usage_logs"
+
+    id = Column(DateTime, primary_key=True, default=datetime.datetime.utcnow)
+    model_name = Column(String)
+    input_tokens = Column(Text)  # Store as string/int
+    output_tokens = Column(Text)
+    request_count = Column(Text, default="1")
+
 async def init_db():
     async with engine.begin() as conn:
-        # For testing, we might want to drop and recreate, but normally we'd use migrations
-        # await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
+
+async def log_usage(model_name: str, input_tokens: int, output_tokens: int):
+    async with AsyncSessionLocal() as session:
+        usage = UsageLog(
+            model_name=model_name,
+            input_tokens=str(input_tokens),
+            output_tokens=str(output_tokens),
+            request_count="1"
+        )
+        session.add(usage)
+        await session.commit()
+
+async def get_total_usage():
+    async with AsyncSessionLocal() as session:
+        # Simple aggregate: sum requests and tokens per model
+        # In a real app we'd use SQL func.sum, but let's keep it simple with a query for now
+        result = await session.execute(select(UsageLog))
+        logs = result.scalars().all()
+        
+        stats = {}
+        for l in logs:
+            m = l.model_name
+            if m not in stats:
+                stats[m] = {"requests": 0, "input": 0, "output": 0}
+            stats[m]["requests"] += 1
+            stats[m]["input"] += int(l.input_tokens or 0)
+            stats[m]["output"] += int(l.output_tokens or 0)
+        return stats
 
 async def create_lecture(task_id: str, title: str, audio_filename: str, pdf_filename: str):
     async with AsyncSessionLocal() as session:
@@ -62,6 +100,17 @@ async def update_lecture_error(task_id: str, error_msg: str):
         if lecture:
             lecture.status = "error"
             lecture.summary = f"Error: {error_msg}"
+            await session.commit()
+
+async def update_lecture_status(task_id: str, status: str = None, progress: int = None, current_step: str = None, active_model: str = None):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Lecture).where(Lecture.id == task_id))
+        lecture = result.scalar_one_or_none()
+        if lecture:
+            if status: lecture.status = status
+            if progress is not None: lecture.progress = progress
+            if current_step: lecture.current_step = current_step
+            if active_model: lecture.active_model = active_model
             await session.commit()
 
 async def get_lecture(task_id: str):
